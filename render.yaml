@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: vegas-odin-walk-advisor
+    runtime: python
+    plan: free
+    buildCommand: ""
+    startCommand: "python server.py"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3

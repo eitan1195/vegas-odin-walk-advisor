@@ -1,0 +1,2 @@
+# No third-party dependencies — server.py uses only the Python standard library.
+# This empty file exists so Render/Heroku-style buildpacks detect the project as Python.
