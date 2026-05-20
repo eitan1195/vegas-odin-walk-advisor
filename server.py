@@ -675,11 +675,12 @@ function render(data, photoUrl) {
       <div class="names"><span>Vegas</span><span>Odin</span></div>
     </div>`;
 
+  const updatedAt = new Date().toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
   document.getElementById("root").innerHTML = `
     ${topHero}
     ${cities.map(renderCity).join("")}
     <button class="refresh-btn" onclick="load()">Refresh now</button>
-    <div class="meta">Data: Open-Meteo. Goldens are double-coated &amp; heat-sensitive.<br>Paw-test pavement (5-sec rule) before every walk.</div>
+    <div class="meta">Data: Open-Meteo &middot; updated ${updatedAt}<br>Goldens are double-coated &amp; heat-sensitive. Paw-test pavement (5-sec rule).</div>
   `;
   refreshTimerUI();
   if (getTimer()) scheduleTick();
@@ -833,6 +834,12 @@ function playChime() {
 }
 
 async function load() {
+  const btn = document.querySelector(".refresh-btn");
+  if (btn) {
+    btn.disabled = true;
+    btn.dataset.prev = btn.textContent;
+    btn.textContent = "Refreshing…";
+  }
   try {
     const [res, photoUrl] = await Promise.all([
       fetch("/api/walk?_=" + Date.now()),
@@ -841,6 +848,13 @@ async function load() {
     if (!res.ok) throw new Error("HTTP " + res.status);
     const data = await res.json();
     render(data, photoUrl);
+    // render() replaced the DOM, so the new button is fresh. Briefly pulse it
+    // so the user sees the refresh completed.
+    const fresh = document.querySelector(".refresh-btn");
+    if (fresh) {
+      fresh.classList.add("pulse");
+      setTimeout(() => fresh.classList.remove("pulse"), 600);
+    }
   } catch (e) {
     document.getElementById("root").innerHTML =
       `<div class="err">Failed to load: ${e.message}<br><br>
