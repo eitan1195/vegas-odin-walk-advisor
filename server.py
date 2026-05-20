@@ -480,6 +480,72 @@ PAGE = """<!doctype html>
   }
   .city-card .msg { color: var(--text); opacity: 0.8; margin-top: 10px; }
   .city-card .verdict-badge { color: #fff; }
+
+  .timer-slot { margin-top: 14px; }
+  .timer-start {
+    width: 100%; padding: 12px;
+    background: transparent; color: var(--accent-dark);
+    border: 2px dashed var(--accent); border-radius: 12px;
+    font-size: 14px; font-weight: 700; cursor: pointer;
+  }
+  .timer-start:active { transform: scale(0.99); }
+  @media (prefers-color-scheme: dark) {
+    .timer-start { color: var(--accent); }
+  }
+  .timer-running {
+    background: var(--bg); border-radius: 12px; padding: 12px;
+    border: 2px solid var(--accent);
+  }
+  .timer-row {
+    display: flex; align-items: center; gap: 8px; margin-bottom: 8px;
+    font-variant-numeric: tabular-nums;
+  }
+  .timer-elapsed { font-size: 22px; font-weight: 800; }
+  .timer-max { font-size: 14px; color: var(--muted); }
+  .timer-stop {
+    margin-left: auto; background: var(--accent); color: #2a1900;
+    border: none; padding: 6px 14px; border-radius: 8px;
+    font-weight: 700; font-size: 13px; cursor: pointer;
+  }
+  .timer-bar {
+    height: 6px; background: var(--line); border-radius: 99px; overflow: hidden;
+  }
+  .timer-bar > div {
+    height: 100%; background: var(--accent); border-radius: 99px;
+    transition: width 0.5s linear;
+  }
+  .timer-over { border-color: #c43a2e; background: rgba(196,58,46,0.12); }
+  .timer-over .timer-elapsed { color: #c43a2e; }
+  .timer-over .timer-bar > div { background: #c43a2e; }
+  .timer-over-msg {
+    margin-top: 8px; color: #c43a2e; font-weight: 700;
+    font-size: 13px; text-align: center;
+  }
+  .timer-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+    display: none; align-items: center; justify-content: center;
+    z-index: 9999; padding: 20px;
+  }
+  .timer-overlay.show { display: flex; animation: fadein 0.2s ease; }
+  @keyframes fadein { from { opacity: 0; } to { opacity: 1; } }
+  .timer-overlay-card {
+    background: var(--card); border-radius: 18px; padding: 24px;
+    max-width: 360px; width: 100%; text-align: center;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  }
+  .timer-overlay-title {
+    font-size: 22px; font-weight: 800; color: #c43a2e;
+    margin-bottom: 8px;
+  }
+  .timer-overlay-msg {
+    font-size: 14px; line-height: 1.4; margin-bottom: 18px;
+    color: var(--text);
+  }
+  .timer-overlay-card button {
+    background: var(--accent); color: #2a1900;
+    border: none; padding: 12px 28px; border-radius: 10px;
+    font-size: 14px; font-weight: 700; cursor: pointer;
+  }
 </style>
 </head>
 <body>
@@ -552,7 +618,7 @@ function renderCity(d) {
     : "";
 
   return `
-    <div class="city-card">
+    <div class="city-card" data-city="${d.city}" data-max-min="${d.max_walk_minutes}">
       <div class="city-header">
         <h2>${d.city}</h2>
         ${stalePill}
@@ -565,6 +631,8 @@ function renderCity(d) {
         </div>
       </div>
       <div class="msg">${d.message}</div>
+
+      <div class="timer-slot"></div>
 
       <div class="section-title">Factors</div>
       ${factor("&#x2600;&#xfe0f;", "Heat", f.heat)}
@@ -613,6 +681,155 @@ function render(data, photoUrl) {
     <button class="refresh-btn" onclick="load()">Refresh now</button>
     <div class="meta">Data: Open-Meteo. Goldens are double-coated &amp; heat-sensitive.<br>Paw-test pavement (5-sec rule) before every walk.</div>
   `;
+  refreshTimerUI();
+  if (getTimer()) scheduleTick();
+}
+
+// ---------- walk timer ----------
+
+const TIMER_KEY = "walkTimer";
+let tickInterval = null;
+let notifiedForStartMs = null;
+let chimeCtx = null;
+
+function getTimer() {
+  try { return JSON.parse(localStorage.getItem(TIMER_KEY)); } catch (e) { return null; }
+}
+function setTimer(t) {
+  if (t) localStorage.setItem(TIMER_KEY, JSON.stringify(t));
+  else localStorage.removeItem(TIMER_KEY);
+}
+
+async function startWalk(cityName, maxMinutes) {
+  if ("Notification" in window && Notification.permission === "default") {
+    try { await Notification.requestPermission(); } catch (e) {}
+  }
+  // Unlock audio context on this user gesture so the chime can play later
+  // even if the tab loses focus (mobile browsers require a gesture first).
+  try {
+    chimeCtx = chimeCtx || new (window.AudioContext || window.webkitAudioContext)();
+    if (chimeCtx.state === "suspended") await chimeCtx.resume();
+  } catch (e) {}
+  setTimer({ city: cityName, startMs: Date.now(), maxMinutes });
+  notifiedForStartMs = null;
+  scheduleTick();
+  refreshTimerUI();
+}
+
+function stopWalk() {
+  setTimer(null);
+  notifiedForStartMs = null;
+  if (tickInterval) { clearInterval(tickInterval); tickInterval = null; }
+  refreshTimerUI();
+}
+
+function scheduleTick() {
+  if (tickInterval) return;
+  tickInterval = setInterval(refreshTimerUI, 1000);
+}
+
+function fmtMMSS(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+function refreshTimerUI() {
+  const t = getTimer();
+  document.querySelectorAll(".city-card[data-city]").forEach(node => {
+    const city = node.dataset.city;
+    const maxFromCard = parseInt(node.dataset.maxMin, 10) || 0;
+    const slot = node.querySelector(".timer-slot");
+    if (!slot) return;
+
+    if (t && t.city === city) {
+      const elapsedSec = (Date.now() - t.startMs) / 1000;
+      const maxSec = t.maxMinutes * 60;
+      const pct = Math.min(100, (elapsedSec / Math.max(1, maxSec)) * 100);
+      const over = elapsedSec >= maxSec;
+      slot.innerHTML = `
+        <div class="timer-running ${over ? "timer-over" : ""}">
+          <div class="timer-row">
+            <span class="timer-elapsed">${fmtMMSS(elapsedSec)}</span>
+            <span class="timer-max">/ ${t.maxMinutes}:00</span>
+            <button class="timer-stop" onclick="stopWalk()">Stop</button>
+          </div>
+          <div class="timer-bar"><div style="width:${pct}%"></div></div>
+          ${over ? `<div class="timer-over-msg">Time's up — head back inside.</div>` : ""}
+        </div>`;
+      if (over && notifiedForStartMs !== t.startMs) {
+        notifiedForStartMs = t.startMs;
+        fireMaxWalkAlert(city);
+      }
+    } else {
+      const disabled = (maxFromCard <= 0) ? "disabled" : "";
+      const label = (maxFromCard <= 0)
+        ? "Not safe to walk now"
+        : `Start ${maxFromCard}-min walk`;
+      slot.innerHTML = `<button class="timer-start" ${disabled}
+        onclick="startWalk('${city.replace(/'/g, "\\'")}', ${maxFromCard})">${label}</button>`;
+    }
+  });
+
+  if (!t && tickInterval) {
+    clearInterval(tickInterval);
+    tickInterval = null;
+  }
+}
+
+function fireMaxWalkAlert(city) {
+  showOverlay(city);
+  if ("Notification" in window && Notification.permission === "granted") {
+    try {
+      new Notification(`Walk time up - ${city}`, {
+        body: "Vegas & Odin have hit the max safe walk duration. Head back inside.",
+        tag: "walk-up",
+      });
+    } catch (e) {}
+  }
+  try { navigator.vibrate && navigator.vibrate([300, 150, 300, 150, 600]); } catch (e) {}
+  playChime();
+}
+
+function showOverlay(city) {
+  let overlay = document.getElementById("timer-overlay");
+  if (!overlay) {
+    overlay = document.createElement("div");
+    overlay.id = "timer-overlay";
+    overlay.className = "timer-overlay";
+    document.body.appendChild(overlay);
+  }
+  overlay.innerHTML = `
+    <div class="timer-overlay-card">
+      <div class="timer-overlay-title">Time's up - ${city}</div>
+      <div class="timer-overlay-msg">Vegas &amp; Odin have hit the max safe walk duration. Head back inside.</div>
+      <button onclick="dismissOverlay()">Got it</button>
+    </div>`;
+  overlay.classList.add("show");
+}
+function dismissOverlay() {
+  const overlay = document.getElementById("timer-overlay");
+  if (overlay) overlay.classList.remove("show");
+}
+
+function playChime() {
+  try {
+    const ctx = chimeCtx || new (window.AudioContext || window.webkitAudioContext)();
+    chimeCtx = ctx;
+    const beep = (freq, when, dur) => {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = "sine"; o.frequency.value = freq;
+      o.connect(g); g.connect(ctx.destination);
+      g.gain.setValueAtTime(0, ctx.currentTime + when);
+      g.gain.linearRampToValueAtTime(0.25, ctx.currentTime + when + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + when + dur);
+      o.start(ctx.currentTime + when);
+      o.stop(ctx.currentTime + when + dur + 0.05);
+    };
+    beep(880, 0.00, 0.45);
+    beep(660, 0.55, 0.45);
+    beep(880, 1.10, 0.55);
+  } catch (e) {}
 }
 
 async function load() {
