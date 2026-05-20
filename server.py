@@ -10,35 +10,45 @@ import mimetypes
 import os
 import socket
 import time
+import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
-BANGKOK_LAT = 13.7563
-BANGKOK_LON = 100.5018
 # Honor $PORT for cloud hosts (Render, Fly, Railway, Hugging Face all set it).
 PORT = int(os.environ.get("PORT", "8080"))
 
-# In-memory cache of the last successful advice payload so a transient upstream
-# failure doesn't take the whole app down with a 502.
-_LAST_OK = {"data": None, "ts": 0.0}
-# How old a cached payload may be before we stop serving it as a fallback.
+CITIES = [
+    {"name": "Bangkok", "lat": 13.7563, "lon": 100.5018, "tz": "Asia/Bangkok"},
+    {"name": "Hua Hin", "lat": 12.5684, "lon": 99.9577,  "tz": "Asia/Bangkok"},
+]
+
+# Per-city cache of the last successful payload so a transient upstream
+# failure for one city doesn't take the whole app down with a 502.
+_LAST_OK = {}  # city name -> {"data": dict, "ts": float}
 STALE_MAX_AGE_SEC = 60 * 60  # 1 hour
 
-WEATHER_URL = (
-    "https://api.open-meteo.com/v1/forecast"
-    f"?latitude={BANGKOK_LAT}&longitude={BANGKOK_LON}"
-    "&current=temperature_2m,relative_humidity_2m,apparent_temperature,"
-    "precipitation,weather_code,wind_speed_10m,uv_index,is_day"
-    "&timezone=Asia%2FBangkok"
-)
-AIR_URL = (
-    "https://air-quality-api.open-meteo.com/v1/air-quality"
-    f"?latitude={BANGKOK_LAT}&longitude={BANGKOK_LON}"
-    "&current=pm2_5,pm10,us_aqi,ozone,nitrogen_dioxide"
-    "&timezone=Asia%2FBangkok"
-)
+def weather_url(lat, lon, tz):
+    tzq = urllib.parse.quote(tz, safe="")
+    return (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lat}&longitude={lon}"
+        "&current=temperature_2m,relative_humidity_2m,apparent_temperature,"
+        "precipitation,weather_code,wind_speed_10m,uv_index,is_day"
+        f"&timezone={tzq}"
+    )
+
+
+def air_url(lat, lon, tz):
+    tzq = urllib.parse.quote(tz, safe="")
+    return (
+        "https://air-quality-api.open-meteo.com/v1/air-quality"
+        f"?latitude={lat}&longitude={lon}"
+        "&current=pm2_5,pm10,us_aqi,ozone,nitrogen_dioxide"
+        f"&timezone={tzq}"
+    )
 
 
 def fetch_json(url, timeout=6, retries=2):
@@ -130,14 +140,16 @@ WEATHER_LABELS = {
 }
 
 
-def compute_advice():
-    w = fetch_json(WEATHER_URL)["current"]
+def compute_advice(city):
+    w_url = weather_url(city["lat"], city["lon"], city["tz"])
+    a_url = air_url(city["lat"], city["lon"], city["tz"])
+    w = fetch_json(w_url)["current"]
     # Air quality API is flakier; degrade gracefully if it fails.
     try:
-        a = fetch_json(AIR_URL)["current"]
+        a = fetch_json(a_url)["current"]
         air_ok = True
     except Exception as e:
-        print(f"  air-quality fetch failed: {e}")
+        print(f"  [{city['name']}] air-quality fetch failed: {e}")
         a = {}
         air_ok = False
 
@@ -212,6 +224,7 @@ def compute_advice():
         notes.append("Air-quality data unavailable right now - score based on weather only.")
 
     return {
+        "city": city["name"],
         "verdict": verdict,
         "verdict_color": verdict_color,
         "message": msg,
@@ -242,26 +255,34 @@ def compute_advice():
     }
 
 
-def get_advice():
-    """Compute fresh advice, falling back to the last good payload on failure."""
+def get_one_advice(city):
+    """Fresh advice for one city, with stale-cache fallback on failure."""
+    name = city["name"]
     try:
-        data = compute_advice()
-        _LAST_OK["data"] = data
-        _LAST_OK["ts"] = time.time()
+        data = compute_advice(city)
+        _LAST_OK[name] = {"data": data, "ts": time.time()}
         return data
     except Exception as e:
-        cached = _LAST_OK["data"]
-        age = time.time() - _LAST_OK["ts"] if cached else None
+        cached = _LAST_OK.get(name)
+        age = time.time() - cached["ts"] if cached else None
         if cached and age is not None and age <= STALE_MAX_AGE_SEC:
-            stale = dict(cached)
+            stale = dict(cached["data"])
             stale["stale"] = True
             stale["age_seconds"] = int(age)
-            stale["notes"] = list(cached.get("notes", [])) + [
+            stale["notes"] = list(cached["data"].get("notes", [])) + [
                 f"Live data unavailable ({type(e).__name__}); showing reading from "
                 f"{int(age // 60)} min ago."
             ]
             return stale
-        raise
+        # No cache to fall back to — surface a per-city error rather than
+        # taking down the whole response.
+        return {"city": name, "error": str(e)}
+
+
+def get_all_advice():
+    """Fetch all cities in parallel; per-city failures don't block siblings."""
+    with ThreadPoolExecutor(max_workers=max(2, len(CITIES))) as ex:
+        return list(ex.map(get_one_advice, CITIES))
 
 
 DOGS_SVG = """
@@ -435,6 +456,30 @@ PAGE = """<!doctype html>
   .err { color: #b8261c; padding: 14px; background: var(--card); border-radius: 12px; }
   .pulse { animation: pulse 2s infinite; }
   @keyframes pulse { 50% { opacity: 0.6; } }
+
+  .city-card {
+    background: var(--card); border-radius: 18px; padding: 18px;
+    margin-bottom: 14px; box-shadow: 0 2px 10px rgba(0,0,0,0.04);
+  }
+  .city-header {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 10px; margin-bottom: 14px;
+  }
+  .city-header h2 {
+    margin: 0; font-size: 20px; font-weight: 800; letter-spacing: -0.2px;
+    text-transform: none; color: var(--text);
+  }
+  .stale-pill {
+    background: var(--line); color: var(--muted);
+    font-size: 11px; font-weight: 600; padding: 4px 9px;
+    border-radius: 99px; white-space: nowrap;
+  }
+  .section-title {
+    margin: 16px 0 10px; font-size: 11px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.8px; color: var(--muted);
+  }
+  .city-card .msg { color: var(--text); opacity: 0.8; margin-top: 10px; }
+  .city-card .verdict-badge { color: #fff; }
 </style>
 </head>
 <body>
@@ -454,15 +499,19 @@ function barColor(score) {
   return "#7a0d0d";
 }
 
-function ring(score) {
+function ring(score, color) {
   const R = 42, C = 2 * Math.PI * R;
   const off = C * (1 - score / 100);
+  const fg = color || "#ffffff";
   return `
     <div class="ring-wrap">
       <svg width="96" height="96" viewBox="0 0 96 96">
-        <circle class="ring-bg" cx="48" cy="48" r="${R}" stroke-width="8" fill="none"/>
-        <circle class="ring-fg" cx="48" cy="48" r="${R}" stroke-width="8" fill="none"
-                stroke-dasharray="${C}" stroke-dashoffset="${off}"/>
+        <circle cx="48" cy="48" r="${R}" stroke-width="8" fill="none"
+                stroke="rgba(127,127,127,0.18)"/>
+        <circle cx="48" cy="48" r="${R}" stroke-width="8" fill="none"
+                stroke="${fg}" stroke-linecap="round"
+                stroke-dasharray="${C}" stroke-dashoffset="${off}"
+                style="transition: stroke-dashoffset 0.6s ease;"/>
       </svg>
       <div class="ring-text"><div class="num">${score}</div><div class="lbl">SCORE</div></div>
     </div>`;
@@ -479,8 +528,15 @@ async function checkPhoto() {
   return null;
 }
 
-function render(d, photoUrl) {
+function renderCity(d) {
+  if (d.error) {
+    return `<div class="city-card">
+      <div class="city-header"><h2>${d.city || "Unknown"}</h2></div>
+      <div class="err">Failed to load: ${d.error}</div>
+    </div>`;
+  }
   const f = d.factors, r = d.raw;
+  const color = d.verdict_color || "#888";
   const factor = (icon, label, score) => `
     <div class="factor">
       <div class="factor-icon">${icon}</div>
@@ -491,41 +547,32 @@ function render(d, photoUrl) {
   const notesHtml = d.notes.length
     ? `<ul class="notes">${d.notes.map(n => `<li>${n}</li>`).join("")}</ul>`
     : `<div class="no-notes">No special warnings right now.</div>`;
+  const stalePill = d.stale
+    ? `<span class="stale-pill">${Math.floor((d.age_seconds || 0) / 60)} min old</span>`
+    : "";
 
-  const dogImg = photoUrl
-    ? `<img class="dogs-img" src="${photoUrl}" alt="Vegas and Odin">`
-    : `<div class="dogs-img" style="padding:8px">${DOGS_SVG_FALLBACK}</div>`;
-
-  document.getElementById("root").innerHTML = `
-    <div class="hero">
-      <div class="hero-top">
-        <div style="flex:1">
-          <div class="hero-title">Walk Advisor</div>
-          <div class="hero-sub">Bangkok - live</div>
-        </div>
+  return `
+    <div class="city-card">
+      <div class="city-header">
+        <h2>${d.city}</h2>
+        ${stalePill}
       </div>
-      ${dogImg}
-      <div class="names"><span>Vegas</span><span>Odin</span></div>
       <div class="verdict-row">
-        ${ring(d.overall_score)}
+        ${ring(d.overall_score, color)}
         <div class="verdict-info">
-          <div class="verdict-badge">${d.verdict}</div>
+          <div class="verdict-badge" style="background:${color}">${d.verdict}</div>
           <div class="max-walk">${d.max_walk_minutes} min<small>max walk</small></div>
         </div>
       </div>
       <div class="msg">${d.message}</div>
-    </div>
 
-    <div class="card">
-      <h2>Factors</h2>
+      <div class="section-title">Factors</div>
       ${factor("&#x2600;&#xfe0f;", "Heat", f.heat)}
       ${factor("&#x1f343;", "Air",  f.air)}
       ${factor("&#x1f327;&#xfe0f;", "Rain", f.rain)}
       ${factor("&#x1f576;&#xfe0f;", "UV",   f.uv)}
-    </div>
 
-    <div class="card">
-      <h2>Conditions now</h2>
+      <div class="section-title">Conditions now</div>
       <div class="stats">
         <div class="stat"><div class="k">Temp</div><div class="v">${r.temperature_c.toFixed(1)}<small> C</small></div></div>
         <div class="stat"><div class="k">Feels like</div><div class="v">${r.apparent_c.toFixed(1)}<small> C</small></div></div>
@@ -536,13 +583,33 @@ function render(d, photoUrl) {
         <div class="stat"><div class="k">Sky</div><div class="v" style="font-size:14px">${r.weather}</div></div>
         <div class="stat"><div class="k">Wind</div><div class="v">${r.wind_kmh}<small> km/h</small></div></div>
       </div>
-    </div>
 
-    <div class="card">
-      <h2>Notes</h2>
+      <div class="section-title">Notes</div>
       ${notesHtml}
-    </div>
+    </div>`;
+}
 
+function render(data, photoUrl) {
+  const cities = data.cities || [];
+  const dogImg = photoUrl
+    ? `<img class="dogs-img" src="${photoUrl}" alt="Vegas and Odin">`
+    : `<div class="dogs-img" style="padding:8px">${DOGS_SVG_FALLBACK}</div>`;
+
+  const topHero = `
+    <div class="hero">
+      <div class="hero-top">
+        <div style="flex:1">
+          <div class="hero-title">Vegas &amp; Odin</div>
+          <div class="hero-sub">Walk Advisor &middot; Thailand</div>
+        </div>
+      </div>
+      ${dogImg}
+      <div class="names"><span>Vegas</span><span>Odin</span></div>
+    </div>`;
+
+  document.getElementById("root").innerHTML = `
+    ${topHero}
+    ${cities.map(renderCity).join("")}
     <button class="refresh-btn" onclick="load()">Refresh now</button>
     <div class="meta">Data: Open-Meteo. Goldens are double-coated &amp; heat-sensitive.<br>Paw-test pavement (5-sec rule) before every walk.</div>
   `;
@@ -555,8 +622,8 @@ async function load() {
       checkPhoto(),
     ]);
     if (!res.ok) throw new Error("HTTP " + res.status);
-    const d = await res.json();
-    render(d, photoUrl);
+    const data = await res.json();
+    render(data, photoUrl);
   } catch (e) {
     document.getElementById("root").innerHTML =
       `<div class="err">Failed to load: ${e.message}<br><br>
@@ -609,8 +676,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/api/walk"):
             try:
-                data = get_advice()
-                self._send(200, json.dumps(data), "application/json")
+                cities = get_all_advice()
+                self._send(200, json.dumps({"cities": cities}), "application/json")
             except Exception as e:
                 self._send(
                     502,
